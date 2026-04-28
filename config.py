@@ -1,0 +1,1 @@
+DATABASE_URL = "postgresql+psycopg2://postgres:pgAdmin98@localhost:5432/geotermia_portamivia" 
