@@ -7,7 +7,7 @@ from database import SessionLocal
 from models import (
     Pozzo, Tipi, Stato, Usi, Scopi, Esiti, Inn,
     Regioni, Province, Comuni, Temp, Grados,
-    Litologia, WellCoord, Metodi, TempConnex, TempFin, TempRaw, Dst, DatiPressione
+    Litologia, WellCoord, Metodi, TempConnex, TempFin, TempRaw, Dst, DatiPressione, Condt, Flusco, Rivest, Deviazione, Mineralizzazioni
 )
 
 router = APIRouter(prefix="/pozzi", tags=["Pozzi"])
@@ -482,6 +482,31 @@ def confronto_pozzi(
         })
 
     return risultati
+
+### ENDPOINT DISPONIBILITA
+
+@router.get("/{key}/disponibilita")
+def disponibilita(key: int, db: Session = Depends(get_db)):
+
+    pozzo = db.query(Pozzo).filter(Pozzo.key == key).first()
+    if not pozzo:
+        raise HTTPException(status_code=404, detail="Pozzo non trovato")
+
+    return {
+        "temperatura": (
+            db.query(TempFin).filter(TempFin.key == key).first() is not None or
+            db.query(Temp).filter(Temp.key == key).first() is not None
+        ),
+        # "temperatura":      db.query(TempFin).filter(TempFin.key == key).first() is not None,
+        "litologia":        db.query(Litologia).filter(Litologia.key == key).first() is not None,
+        "gradiente":        db.query(Grados).filter(Grados.key == key).first() is not None,
+        "conduttivita":     db.query(Condt).filter(Condt.key == key).first() is not None,
+        "flusso_calore":    db.query(Flusco).filter(Flusco.key == key).first() is not None,
+        "rivestimento":     db.query(Rivest).filter(Rivest.key == key).first() is not None,
+        "mineralizzazioni": db.query(Mineralizzazioni).filter(Mineralizzazioni.key == key).first() is not None,
+        "dst":              db.query(Dst).filter(Dst.key == key).first() is not None,
+        "deviazione":       db.query(Deviazione).filter(Deviazione.key == key).first() is not None,
+    }
 
 
 # ENDPOINT DETTAGLIO SINGOLO POZZO
