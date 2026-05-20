@@ -1031,3 +1031,12 @@ class PozziLitologiaStrCronostr(Base):
     eta_sup      = Column(String(64))
     eta_inf      = Column(String(64))
     # nessuna FK esplicita nel DB — è una tabella denormalizzata/vista
+
+class Utente(Base):
+    __tablename__ = "utenti"
+    __table_args__ = {"schema": "public"}
+
+    id       = Column(Integer, primary_key=True)
+    username = Column(String(50), unique=True, nullable=False)
+    password = Column(String(255), nullable=False)
+    ruolo    = Column(String(10), nullable=False)

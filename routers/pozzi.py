@@ -7,8 +7,9 @@ from database import SessionLocal
 from models import (
     Pozzo, Tipi, Stato, Usi, Scopi, Esiti, Inn,
     Regioni, Province, Comuni, Temp, Grados,
-    Litologia, WellCoord, Metodi, TempConnex, TempFin, TempRaw, Dst, DatiPressione, Condt, Flusco, Rivest, Deviazione, Mineralizzazioni
+    Litologia, WellCoord, Metodi, TempConnex, TempFin, TempRaw, Dst, DatiPressione, Condt, Flusco, Rivest, Deviazione, Mineralizzazioni, FluidoT
 )
+from routers.auth import require_esperto, require_base
 
 router = APIRouter(prefix="/pozzi", tags=["Pozzi"])
 
@@ -115,7 +116,8 @@ def mappa_pozzi(
     temp_max:  float | None = Query(default=None, description="Temperatura massima (°C)"),
 
     limit: int = Query(default=1000, le=5000, description="Max risultati"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user = Depends(require_base)
     #oggetto user
 ):
     qb = QueryBuilder(db)
@@ -353,7 +355,8 @@ def distribuzione(
 @router.get("/confronto", summary="Dettaglio e confronto di uno o più pozzi")
 def confronto_pozzi(
     key: List[int] = Query(..., description="Uno o più key di pozzi da confrontare"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user = Depends(require_esperto)
 ):
     if len(key) > 10:
         raise HTTPException(status_code=400, detail="Massimo 10 pozzi per confronto")
@@ -507,6 +510,188 @@ def disponibilita(key: int, db: Session = Depends(get_db)):
         "dst":              db.query(Dst).filter(Dst.key == key).first() is not None,
         "deviazione":       db.query(Deviazione).filter(Deviazione.key == key).first() is not None,
     }
+
+
+### NUOVI ENDPOINT PER LA MINERALIZZAZIONE
+
+# ==================================================
+# ENDPOINT MINERALIZZAZIONI
+# Filtro avanzato per tipo di fluido e profondità.
+# Accessibile solo agli utenti esperti.
+#
+# Uso:
+#   GET /pozzi/mineralizzazioni
+#   GET /pozzi/mineralizzazioni?tipo_fluido=3
+#   GET /pozzi/mineralizzazioni?tipo_fluido=5&prof_min=500&prof_max=2000
+#   GET /pozzi/mineralizzazioni?tipo_fluido=3&regione=12
+# ==================================================
+@router.get("/mineralizzazioni", summary="Filtro avanzato mineralizzazioni (solo esperti)")
+def mineralizzazioni(
+    tipo_fluido: int | None = Query(default=None, description="Codice tipo fluido (es. 3=acqua salata, 5=gas)"),
+    prof_min:    float | None = Query(default=None, description="Profondità minima evento (m)"),
+    prof_max:    float | None = Query(default=None, description="Profondità massima evento (m)"),
+    regione:     int | None = Query(default=None, description="Codice regione"),
+    limit:       int = Query(default=200, le=1000),
+    db: Session = Depends(get_db),
+    #current_user = Depends(require_esperto)
+):
+    """
+    Restituisce i pozzi che hanno mineralizzazioni corrispondenti
+    ai filtri selezionati. Ogni pozzo può avere più eventi di
+    mineralizzazione a profondità diverse.
+    """
+    query = (
+        db.query(
+            Pozzo.key,
+            Pozzo.nome,
+            Pozzo.lat_,
+            Pozzo.lon_,
+            Pozzo.prof,
+            Mineralizzazioni.top,
+            Mineralizzazioni.bottom,
+            Mineralizzazioni.tipo_fluido,
+            FluidoT.descrizione.label("fluido_descrizione")
+        )
+        .join(Mineralizzazioni, Pozzo.key == Mineralizzazioni.key)
+        .join(FluidoT, Mineralizzazioni.tipo_fluido == FluidoT.fluido_t)
+        .filter(Pozzo.lat_.isnot(None), Pozzo.lon_.isnot(None))
+    )
+ 
+    if tipo_fluido is not None:
+        query = query.filter(Mineralizzazioni.tipo_fluido == tipo_fluido)
+ 
+    if prof_min is not None:
+        query = query.filter(Mineralizzazioni.top >= prof_min)
+ 
+    if prof_max is not None:
+        query = query.filter(Mineralizzazioni.bottom <= prof_max)
+ 
+    if regione is not None:
+        query = query.filter(Pozzo.reg == regione)
+ 
+    risultati = query.limit(limit).all()
+ 
+    return [
+        {
+            "key":              r.key,
+            "nome":             r.nome,
+            "lat":              r.lat_,
+            "lon":              r.lon_,
+            "profondita_pozzo": r.prof,
+            "top":              r.top,
+            "bottom":           r.bottom,
+            "tipo_fluido":      r.tipo_fluido,
+            "fluido":           r.fluido_descrizione,
+        }
+        for r in risultati
+    ]
+ 
+ 
+# ==================================================
+# ENDPOINT TIPI FLUIDO
+# Restituisce la lista dei tipi di fluido disponibili
+# con il conteggio degli eventi.
+# Utile al frontend per popolare il selettore del filtro.
+#
+# Uso:
+#   GET /pozzi/mineralizzazioni/tipi
+# ==================================================
+@router.get("/mineralizzazioni/tipi", summary="Lista tipi fluido con conteggio")
+def tipi_fluido(
+    db: Session = Depends(get_db),
+    #current_user = Depends(require_base)
+):
+    """
+    Restituisce tutti i tipi di fluido presenti nel dataset
+    con il numero di eventi per ciascuno.
+    Usato dal frontend per popolare il selettore del filtro mineralizzazioni.
+    """
+    results = (
+        db.query(
+            FluidoT.fluido_t,
+            FluidoT.descrizione,
+            func.count(Mineralizzazioni.oid).label("n_eventi")
+        )
+        .join(Mineralizzazioni, FluidoT.fluido_t == Mineralizzazioni.tipo_fluido)
+        .filter(Mineralizzazioni.key.in_(
+            db.query(Pozzo.key)
+        ))
+        .group_by(FluidoT.fluido_t, FluidoT.descrizione)
+        .order_by(func.count(Mineralizzazioni.oid).desc())
+        .all()
+    )
+ 
+    return [
+        {
+            "codice":    r.fluido_t,
+            "fluido":    r.descrizione,
+            "n_eventi":  r.n_eventi
+        }
+        for r in results
+    ]
+ 
+ 
+# ==================================================
+# ENDPOINT MATRICE CO-OCCORRENZA
+# Incrocia fluido ↔ litologia su tutti i pozzi del dataset.
+# Accessibile solo agli utenti esperti.
+#
+# Uso:
+#   GET /pozzi/mineralizzazioni/cooccorrenza
+#   GET /pozzi/mineralizzazioni/cooccorrenza?prof_min=500&prof_max=2000
+# ==================================================
+@router.get("/mineralizzazioni/cooccorrenza", summary="Matrice co-occorrenza fluido ↔ litologia (solo esperti)")
+def cooccorrenza(
+    prof_min: float | None = Query(default=None, description="Profondità minima (m)"),
+    prof_max: float | None = Query(default=None, description="Profondità massima (m)"),
+    db: Session = Depends(get_db),
+    #current_user = Depends(require_esperto)
+):
+    """
+    Calcola la matrice di co-occorrenza tra tipo di fluido e litologia.
+    Per ogni coppia (fluido, litologia) conta quanti pozzi distinti
+    presentano entrambi nello stesso intervallo di profondità.
+ 
+    Utile per rispondere a domande tipo:
+    "Quanti pozzi con gas attraversano litologie carbonatiche tra 1000 e 2500m?"
+    """
+    query = (
+        db.query(
+            FluidoT.descrizione.label("fluido"),
+            Litologia.litologia.label("litologia"),
+            func.count(func.distinct(Mineralizzazioni.key)).label("n_pozzi")
+        )
+        .join(Mineralizzazioni, FluidoT.fluido_t == Mineralizzazioni.tipo_fluido)
+        .join(
+            Litologia,
+            (Litologia.key == Mineralizzazioni.key) &
+            (Litologia.daprof <= Mineralizzazioni.bottom) &
+            (Litologia.aprof  >= Mineralizzazioni.top)
+        )
+        .filter(Mineralizzazioni.key.in_(db.query(Pozzo.key)))
+    )
+ 
+    if prof_min is not None:
+        query = query.filter(Mineralizzazioni.top >= prof_min)
+    if prof_max is not None:
+        query = query.filter(Mineralizzazioni.bottom <= prof_max)
+ 
+    results = (
+        query
+        .group_by(FluidoT.descrizione, Litologia.litologia)
+        .order_by(func.count(func.distinct(Mineralizzazioni.key)).desc())
+        .limit(100)  # limite per evitare risposte enormi
+        .all()
+    )
+ 
+    return [
+        {
+            "fluido":    r.fluido,
+            "litologia": r.litologia,
+            "n_pozzi":   r.n_pozzi
+        }
+        for r in results
+    ]
 
 
 # ENDPOINT DETTAGLIO SINGOLO POZZO

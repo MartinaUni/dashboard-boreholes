@@ -74,28 +74,28 @@ def eta_geologica(
     # cerco prima nell'epoca (livello più fine)
     epoca = (
         db.query(Epoca)
-        .filter(Epoca.anni_inf <= anni, Epoca.anni_sup >= anni)
+        .filter(Epoca.anni_inf >= anni, Epoca.anni_sup <= anni)
         .first()
     )
 
     # poi nel periodo
     periodo = (
         db.query(Periodo)
-        .filter(Periodo.anni_inf <= anni, Periodo.anni_sup >= anni)
+        .filter(Periodo.anni_inf >= anni, Periodo.anni_sup <= anni)
         .first()
     )
 
     # poi nell'era
     era = (
         db.query(Era)
-        .filter(Era.anni_inf <= anni, Era.anni_sup >= anni)
+        .filter(Era.anni_inf >= anni, Era.anni_sup <= anni)
         .first()
     )
 
     # poi nell'eone
     eone = (
         db.query(Eone)
-        .filter(Eone.anni_inf <= anni, Eone.anni_sup >= anni)
+        .filter(Eone.anni_inf >= anni, Eone.anni_sup <= anni)
         .first()
     )
 
