@@ -17,8 +17,6 @@ def get_db():
     finally:
         db.close()
 
-
-
 #  SCALA GEOLOGICA COMPLETA
 # Uso:
 #   GET /geologia/scala

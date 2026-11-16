@@ -2,20 +2,88 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List
+from fastapi import status
 
 from database import SessionLocal
 from models import (
     Pozzo, Tipi, Stato, Usi, Scopi, Esiti, Inn,
     Regioni, Province, Comuni, Temp, Grados,
-    Litologia, WellCoord, Metodi, TempConnex, TempFin, TempRaw, Dst, DatiPressione, Condt, Flusco, Rivest, Deviazione, Mineralizzazioni, FluidoT
+    Litologia, WellCoord, Metodi, TempConnex, TempFin, TempRaw, Dst, DatiPressione, Condt, Flusco, Rivest, Deviazione, Mineralizzazioni, FluidoT, LitologiaStandard
 )
 from routers.auth import require_esperto, require_base
 
 router = APIRouter(prefix="/pozzi", tags=["Pozzi"])
+# ============================================================
+# ANALISI GEOLOGICA INTEGRATA (LitologiaStandard × Grados)
+# ============================================================
+
+CARBONATICI  = ['CALCARE', 'DOLOMIA', 'MARNA', 'MUDSTONE', 'WACKESTONE', 'PACKSTONE']
+CLASTICI     = ['ARGILLA', 'SABBIA', 'ARENARIA', 'ALLUVIONE']
+EVAPORITICI  = ['ANIDRITE', 'GESSO', 'SALGEMMA']
+PERMEABILI   = ['CALCARE', 'DOLOMIA', 'ARENARIA', 'WACKESTONE', 'PACKSTONE']
 
 
 
 # DATABASE SESSION
+
+"""
+def calcola_gradiente_da_profilo(temperatures):
+    
+    if not temperatures or len(temperatures) < 2:
+        return None
+    
+    t_inizio = temperatures[0]  # (prof, temp)
+    t_fine = temperatures[-1]
+    
+    delta_prof = t_fine['prof'] - t_inizio['prof']
+    delta_temp = t_fine['temp'] - t_inizio['temp']
+    
+    if delta_prof == 0:
+        return None
+    
+    # Gradiente in °C/km
+    return (delta_temp / delta_prof) * 1000
+"""
+
+TEMPERATURA_SUPERFICIE_ITALIA = 15.0  # °C — media annua dell'aria in Italia (letteratura geotermica)
+
+def calcola_gradiente_da_profilo(temperatures, temp_superficie=TEMPERATURA_SUPERFICIE_ITALIA):
+    """
+    Calcola il gradiente geotermico usando come riferimento a profondità
+    zero la temperatura media annua dell'aria esterna (in assenza di una
+    misura reale vicino alla superficie), e la misura più profonda
+    disponibile per il pozzo.
+
+    Questo permette di calcolare un gradiente anche con una SOLA misura
+    di temperatura in pozzo (caso frequente nel dataset), a differenza
+    del metodo precedente che richiedeva almeno due punti misurati.
+    """
+    if not temperatures:
+        return None
+
+    # punto più profondo disponibile
+    t_fondo = max(temperatures, key=lambda t: t['prof'])
+
+    if t_fondo['prof'] <= 0:
+        return None  # non ha senso calcolare un gradiente a profondità 0
+
+    delta_temp = t_fondo['temp'] - temp_superficie
+    return (delta_temp / t_fondo['prof']) * 1000
+
+def _calcola_gradiente_sicuro(key, grad_map, profili_termici):
+    """Ritorna il gradiente arrotondato, o None se non calcolabile in alcun modo."""
+    if key in grad_map:
+        return round(grad_map[key], 2)
+
+    profilo = profili_termici.get(key)
+    if not profilo:
+        return None
+
+    gradiente = calcola_gradiente_da_profilo(profilo)
+    if gradiente is None:
+        return None
+
+    return round(gradiente, 2)
 
 def get_db():
     db = SessionLocal()
@@ -85,7 +153,21 @@ METRICHE = {
     "gradiente_max":    (func.max(Grados.grad), "grados"),
 }
 
+#diagnostica
 
+# Aggiungi questo endpoint per diagnostica:
+@router.get("/diagnostica/gradiente")
+def diagnostica_gradiente(db: Session = Depends(get_db)):
+    total_pozzi = db.query(Pozzo).count()
+    pozzi_con_grados = db.query(func.count(func.distinct(Grados.key))).scalar()
+    pozzi_con_tempfin = db.query(func.count(func.distinct(TempFin.key))).scalar()
+    
+    return {
+        "total_pozzi": total_pozzi,
+        "con_gradiente": pozzi_con_grados,
+        "con_temperatura": pozzi_con_tempfin,
+        "percentuale_grados": round((pozzi_con_grados / total_pozzi * 100), 1) if total_pozzi else 0,
+    }
 
 #  ENDPOINT MAPPA
 # Restituisce i pozzi con coordinate per la visualizzazione
@@ -96,6 +178,8 @@ METRICHE = {
 #   GET /pozzi/mappa?regione=Toscana
 #   GET /pozzi/mappa?prof_min=1000&prof_max=3000
 #   GET /pozzi/mappa?temp_min=50&tipo=Geotermico
+
+
 
 @router.get("/mappa", summary="Pozzi per la mappa con filtri opzionali")
 def mappa_pozzi(
@@ -117,9 +201,10 @@ def mappa_pozzi(
 
     limit: int = Query(default=1000, le=5000, description="Max risultati"),
     db: Session = Depends(get_db),
-    current_user = Depends(require_base)
+    #current_user = Depends(require_base)
     #oggetto user
 ):
+    #costruisco query
     qb = QueryBuilder(db)
 
     if regione is not None:
@@ -167,18 +252,89 @@ def mappa_pozzi(
         .all()
     }
 
+    # Join con WellCoord per le coordinate corrette
+    from sqlalchemy.orm import joinedload
+
+    risultati = (
+        qb.get()
+        .filter(Pozzo.lat_.isnot(None), Pozzo.lon_.isnot(None))
+        .limit(limit)
+        .all()
+    )
+
+    # Prendi le temperature
+    keys = [p.key for p in risultati]
+    temp_map = {
+        row[0]: row[1]
+        for row in db.query(TempFin.key, func.max(TempFin.temp))
+        .filter(TempFin.key.in_(keys))
+        .group_by(TempFin.key)
+        .all()
+    }
+
+    from sqlalchemy import text
+
+    # Dopo aver ottenuto risultati e keys...
+
+    geom_map = {
+        row[0]: (row[1], row[2])
+        for row in db.execute(
+            text("""
+                SELECT key, ST_Y(the_geom) as lat, ST_X(the_geom) as lon
+                FROM public.pozzi
+                WHERE key = ANY(:keys) AND the_geom IS NOT NULL
+            """),
+            {"keys": keys}
+        ).all()
+    }
+
+    # Prendi il gradiente medio per pozzo
+    grad_map = {
+        row[0]: row[1]
+        for row in db.query(Grados.key, func.avg(Grados.grad))
+        .filter(Grados.key.in_(keys))
+        .group_by(Grados.key)
+        .all()
+    }
+    #aggiunta questa parte:
+    # Prendi il profilo termico completo per ogni pozzo
+    profili_termici = {}
+    for k in keys:
+        profilo = (
+            db.query(TempFin.prof, TempFin.temp)
+            .filter(TempFin.key == k)
+            .order_by(TempFin.prof)
+            .all()
+        )
+        if profilo:
+            profili_termici[k] = [
+                {"prof": p[0], "temp": p[1]} for p in profilo
+            ]
+    
+    # Prendi i gradienti già calcolati (fallback)
+    grad_map = {
+        row[0]: row[1]
+        for row in db.query(Grados.key, func.avg(Grados.grad))
+        .filter(Grados.key.in_(keys))
+        .group_by(Grados.key)
+        .all()
+    }
+    
+    # Ritorna con gradiente calcolato se manca
     return [
         {
-            "key":        p.key,
-            "nome":       p.nome,
-            "lat":        p.lat_,
-            "lon":        p.lon_,
+            "key": p.key,
+            "nome": p.nome,
+            "lat": geom_map[p.key][0] if p.key in geom_map else p.lat_,
+            "lon": geom_map[p.key][1] if p.key in geom_map else p.lon_,
             "profondita": p.prof,
-            "quota":      p.quota,
-            "temp_max":   round(temp_map[p.key], 2) if p.key in temp_map else None,
+            "quota": p.quota,
+            "temp_max": round(temp_map[p.key], 2) if p.key in temp_map else None,
+            "gradiente": _calcola_gradiente_sicuro(p.key, grad_map, profili_termici),
         }
         for p in risultati
     ]
+    
 
 
 
@@ -346,20 +502,219 @@ def distribuzione(
         for nome, count in results
     ]
 
+@router.get("/mappa/avanzata", summary="Mappa con filtri avanzati (litologia + mineralizzazione)")
+def mappa_avanzata(
+    tipo_fluido: List[int] = Query(default=[]),
+    prof_min: float | None = Query(default=None, description="Profondità minima evento (m)"),
+    prof_max: float | None = Query(default=None, description="Profondità massima evento (m)"),
+    termine_lito: List[str] = Query(default=[], description="Termini litologici standardizzati"),
+    ruolo: str = Query(default='tutte'),
+    limit: int = Query(default=1000, le=5000, description="Max risultati"),
+    db: Session = Depends(get_db),
+):
+    """
+    Ritorna pozzi filtrati per mineralizzazioni e litologie.
+    
+    Logica:
+    - Se mineralizzazione + ruolo: conta pozzi dove l'evento mineralizzazione
+      si verifica DENTRO uno strato di litologia con quel ruolo (overlap spaziale)
+    - Se solo ruolo (senza mineralizzazione): conta pozzi con litologie di quel ruolo
+    - Se mineralizzazione + litologie: conta pozzi dove evento è dentro quella litologia
+    """
+    
+    # Se nessun filtro, ritorna vuoto
+    if len(tipo_fluido) == 0 and len(termine_lito) == 0 and ruolo == 'tutte':
+        return []
+    
+    subquery = db.query(func.distinct(Pozzo.key)).filter(
+        Pozzo.lat_.isnot(None),
+        Pozzo.lon_.isnot(None)
+    )
+    
+    # ========== CASO 1: MINERALIZZAZIONE + RUOLO (overlap spaziale) ==========
+    if len(tipo_fluido) > 0 and ruolo != 'tutte' and len(termine_lito) == 0:
+        """
+        Cerca pozzi dove l'evento di mineralizzazione cade dentro
+        uno strato di litologia con quel ruolo.
+        """
+        subquery = subquery.join(Mineralizzazioni, Pozzo.key == Mineralizzazioni.key)
+        subquery = subquery.join(
+            LitologiaStandard,
+            (LitologiaStandard.key == Mineralizzazioni.key) &
+            (LitologiaStandard.daprof < Mineralizzazioni.bottom) &  # overlap
+            (LitologiaStandard.aprof > Mineralizzazioni.top)         # overlap
+        )
+        
+        subquery = subquery.filter(Mineralizzazioni.tipo_fluido.in_(tipo_fluido))
+        subquery = subquery.filter(LitologiaStandard.ruolo == ruolo)
+        
+        if prof_min is not None:
+            subquery = subquery.filter(Mineralizzazioni.top >= prof_min)
+        if prof_max is not None:
+            subquery = subquery.filter(Mineralizzazioni.bottom <= prof_max)
+    
+    # ========== CASO 2: MINERALIZZAZIONE + LITOLOGIE ==========
+    elif len(tipo_fluido) > 0 and len(termine_lito) > 0:
+        """
+        Cerca pozzi dove l'evento di mineralizzazione cade dentro
+        uno strato delle litologie selezionate.
+        """
+        subquery = subquery.join(Mineralizzazioni, Pozzo.key == Mineralizzazioni.key)
+        subquery = subquery.join(
+            LitologiaStandard,
+            (LitologiaStandard.key == Mineralizzazioni.key) &
+            (LitologiaStandard.daprof < Mineralizzazioni.bottom) &
+            (LitologiaStandard.aprof > Mineralizzazioni.top)
+        )
+        
+        subquery = subquery.filter(Mineralizzazioni.tipo_fluido.in_(tipo_fluido))
+        subquery = subquery.filter(LitologiaStandard.litologia_standard.in_(termine_lito))
+        
+        if ruolo != 'tutte':
+            subquery = subquery.filter(LitologiaStandard.ruolo == ruolo)
+        
+        if prof_min is not None:
+            subquery = subquery.filter(Mineralizzazioni.top >= prof_min)
+        if prof_max is not None:
+            subquery = subquery.filter(Mineralizzazioni.bottom <= prof_max)
+    
+    # ========== CASO 3: MINERALIZZAZIONE SOLO (senza litologia) ==========
+    elif len(tipo_fluido) > 0:
+        """
+        Cerca pozzi con la mineralizzazione selezionata.
+        """
+        subquery = subquery.join(Mineralizzazioni, Pozzo.key == Mineralizzazioni.key)
+        subquery = subquery.filter(Mineralizzazioni.tipo_fluido.in_(tipo_fluido))
+        
+        if prof_min is not None:
+            subquery = subquery.filter(Mineralizzazioni.top >= prof_min)
+        if prof_max is not None:
+            subquery = subquery.filter(Mineralizzazioni.bottom <= prof_max)
+    
+    # ========== CASO 4: LITOLOGIE + RUOLO (senza mineralizzazione) ==========
+    elif len(termine_lito) > 0 or ruolo != 'tutte':
+        """
+        Cerca pozzi con le litologie selezionate.
+        """
+        subquery = subquery.join(LitologiaStandard, Pozzo.key == LitologiaStandard.key)
+        
+        if len(termine_lito) > 0:
+            subquery = subquery.filter(LitologiaStandard.litologia_standard.in_(termine_lito))
+        
+        if ruolo != 'tutte':
+            subquery = subquery.filter(LitologiaStandard.ruolo == ruolo)
+        if prof_min is not None:
+            subquery = subquery.filter(LitologiaStandard.daprof >= prof_min)
+        if prof_max is not None:
+            subquery = subquery.filter(LitologiaStandard.aprof <= prof_max)
+    # ========== ESTRAI I KEY ==========
+    keys = [row[0] for row in subquery.all()]
+    print(f' Mappa avanzata: {len(keys)} pozzi trovati')
+    
+    if not keys:
+        return []
+    
+    # ========== QUERY PULITA SU POZZO ==========
+    risultati = db.query(Pozzo).filter(Pozzo.key.in_(keys)).limit(limit).all()
+    
+    # ========== ESTRAI COORDINATE DA the_geom (PostGIS) ==========
+    from sqlalchemy import text
+    
+    geom_map = {
+        row[0]: (row[1], row[2])
+        for row in db.execute(
+            text("""
+                SELECT key, 
+                       ST_Y(the_geom) as lat, 
+                       ST_X(the_geom) as lon
+                FROM public.pozzi
+                WHERE key = ANY(:keys) 
+                  AND the_geom IS NOT NULL
+            """),
+            {"keys": keys}
+        ).all()
+    }
+    
+    # ========== ESTRAI TEMPERATURE ==========
+    temp_map = {
+        row[0]: row[1]
+        for row in db.query(TempFin.key, func.max(TempFin.temp))
+        .filter(TempFin.key.in_(keys))
+        .group_by(TempFin.key)
+        .all()
+    }
+    
+    # ========== ESTRAI GRADIENTI ==========
+    grad_map = {
+        row[0]: row[1]
+        for row in db.query(Grados.key, func.avg(Grados.grad))
+        .filter(Grados.key.in_(keys))
+        .group_by(Grados.key)
+        .all()
+    }
+    
+    
+    # Se un pozzo non ha gradiente in Grados, calcola da TempFin
+    if len(grad_map) < len(keys):
+        for k in keys:
+            if k not in grad_map:
+                profile = (
+                    db.query(TempFin.prof, TempFin.temp)
+                    .filter(TempFin.key == k)
+                    .order_by(TempFin.prof)
+                    .all()
+                )
+                
+                if profile and len(profile) >= 2:
+                    p1_prof, p1_temp = profile[0]
+                    p2_prof, p2_temp = profile[-1]
+                    delta_prof = p2_prof - p1_prof
+                    delta_temp = p2_temp - p1_temp
+                    
+                    if delta_prof > 0:
+                        grad = (delta_temp / delta_prof) * 1000  # °C/km
+                        grad_map[k] = grad
+    
+    # ========== RITORNA RISULTATI ==========
+    return [
+        {
+            "key":        p.key,
+            "nome":       p.nome,
+            "lat":        geom_map[p.key][0] if p.key in geom_map else p.lat_,
+            "lon":        geom_map[p.key][1] if p.key in geom_map else p.lon_,
+            "profondita": p.prof,
+            "quota":      p.quota,
+            "temp_max":   round(temp_map[p.key], 2) if p.key in temp_map else None,
+            "gradiente":  round(grad_map[p.key], 2) if p.key in grad_map else None,
+        }
+        for p in risultati
+    ]
 
 
-# ENDPOINT CONFRONTO
-# Dettaglio di uno o più pozzi affiancati.
-
+from routers.auth import get_current_user_optional
 
 @router.get("/confronto", summary="Dettaglio e confronto di uno o più pozzi")
 def confronto_pozzi(
     key: List[int] = Query(..., description="Uno o più key di pozzi da confrontare"),
     db: Session = Depends(get_db),
-    current_user = Depends(require_esperto)
+    current_user = Depends(get_current_user_optional),
 ):
     if len(key) > 10:
         raise HTTPException(status_code=400, detail="Massimo 10 pozzi per confronto")
+
+    # Il confronto tra PIÙ pozzi è riservato agli utenti esperti autenticati.
+    # Il dettaglio di un SINGOLO pozzo resta accessibile a tutti.
+    if len(key) > 1:
+        if current_user is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Login richiesto per confrontare più pozzi"
+            )
+        if current_user.ruolo != "esperto":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Il confronto tra pozzi è riservato agli utenti esperti"
+            )
 
     risultati = []
 
@@ -373,10 +728,8 @@ def confronto_pozzi(
         provincia = db.query(Province).filter(Province.prov == pozzo.prov).first()
         comune   = db.query(Comuni).filter(Comuni.istat == pozzo.istat).first()
 
-        # trova id_dst
         dst_records = (db.query(Dst).filter(Dst.key == k).all())
 
-        # temperature ordinate per profondità
         temperature = (
             db.query(TempFin)
             .filter(TempFin.key == k)
@@ -384,8 +737,6 @@ def confronto_pozzi(
             .all()
         )
 
-
-        # litologia
         litologie = (
             db.query(Litologia)
             .filter(Litologia.key == k)
@@ -393,7 +744,6 @@ def confronto_pozzi(
             .all()
         )
 
-        # gradiente geotermico
         gradienti = (
             db.query(Grados)
             .filter(Grados.key == k)
@@ -401,21 +751,36 @@ def confronto_pozzi(
             .all()
         )
 
-        # temperatura massima (per scatter plot e KPI)
         temp_max = (
             db.query(func.max(TempFin.temp))
             .filter(TempFin.key == k)
             .scalar()
         )
 
-        # gradiente medio (per KPI)
+        """grad_medio = (
+            db.query(func.avg(Grados.grad))
+            .filter(Grados.key == k)
+            .scalar()
+        )"""
+        # gradiente medio — prima prova Grados, poi calcola dal profilo termico
         grad_medio = (
             db.query(func.avg(Grados.grad))
             .filter(Grados.key == k)
             .scalar()
         )
 
-        
+        if grad_medio is None:
+            profilo_per_gradiente = [
+                {"prof": t.prof, "temp": t.temp} for t in temperature
+            ]
+            grad_medio = calcola_gradiente_da_profilo(profilo_per_gradiente)
+
+        litologie_std = (
+            db.query(LitologiaStandard)
+            .filter(LitologiaStandard.key == k)
+            .order_by(LitologiaStandard.daprof)
+            .all()
+        )
 
         risultati.append({
             "anagrafica": {
@@ -444,8 +809,8 @@ def confronto_pozzi(
                 "esito": get_descrizione(db, Esiti, Esiti.esitom, pozzo.esitom),
             },
             "kpi": {
-                "temp_max":    round(temp_max, 2)   if temp_max   else None,
-                "grad_medio":  round(grad_medio, 2) if grad_medio else None,
+                "temp_max":    round(temp_max, 2)   if temp_max is not None   else None,
+                "grad_medio":  round(grad_medio, 2) if grad_medio is not None else None,
                 "prof_max":    pozzo.prof,
             },
             "temperatura_vs_profondita": [
@@ -481,6 +846,16 @@ def confronto_pozzi(
             "gradiente_geotermico": [
                 {"da": g.daprof, "a": g.aprof, "grad": g.grad, "condm": g.condm}
                 for g in gradienti
+            ],
+            "litologia_standard": [
+                {
+                    "da": l.daprof,
+                    "a":  l.aprof,
+                    "litologia": l.litologia_standard,
+                    "ruolo": l.ruolo,
+                    "relazione": l.relazione
+                }
+                for l in litologie_std
             ]
         })
 
@@ -596,187 +971,285 @@ def mineralizzazioni(
 # Uso:
 #   GET /pozzi/mineralizzazioni/tipi
 # ==================================================
-@router.get("/mineralizzazioni/tipi", summary="Lista tipi fluido con conteggio")
+from typing import Optional
+@router.get("/mineralizzazioni/tipi")
 def tipi_fluido(
+    ruolo: str = Query(default='tutte'),  # ← DEFAULT 'tutte'
     db: Session = Depends(get_db),
-    #current_user = Depends(require_base)
 ):
-    """
-    Restituisce tutti i tipi di fluido presenti nel dataset
-    con il numero di eventi per ciascuno.
-    Usato dal frontend per popolare il selettore del filtro mineralizzazioni.
-    """
-    results = (
+    print(f" tipi_fluido chiamato con ruolo={ruolo}")
+    
+    query = (
         db.query(
             FluidoT.fluido_t,
             FluidoT.descrizione,
-            func.count(Mineralizzazioni.oid).label("n_eventi")
+            func.count(func.distinct(Mineralizzazioni.key)).label("n_eventi")
         )
         .join(Mineralizzazioni, FluidoT.fluido_t == Mineralizzazioni.tipo_fluido)
-        .filter(Mineralizzazioni.key.in_(
-            db.query(Pozzo.key)
-        ))
+        .join(Pozzo, Pozzo.key == Mineralizzazioni.key)
+    )
+    
+    if ruolo != 'tutte':  # ← Se NON è 'tutte', applica il filtro
+        query = query.join(
+            LitologiaStandard,
+            (LitologiaStandard.key == Mineralizzazioni.key) &
+            (LitologiaStandard.daprof < Mineralizzazioni.bottom) &
+            (LitologiaStandard.aprof > Mineralizzazioni.top)
+        )
+        query = query.filter(LitologiaStandard.ruolo == ruolo)
+    
+    results = (
+        query
         .group_by(FluidoT.fluido_t, FluidoT.descrizione)
         .order_by(func.count(Mineralizzazioni.oid).desc())
         .all()
     )
- 
+
     return [
         {
-            "codice":    r.fluido_t,
-            "fluido":    r.descrizione,
-            "n_eventi":  r.n_eventi
+            "codice": r.fluido_t,
+            "fluido": r.descrizione,
+            "n_eventi": r.n_eventi
         }
         for r in results
     ]
- 
- 
-# ==================================================
-# ENDPOINT MATRICE CO-OCCORRENZA
-# Incrocia fluido ↔ litologia su tutti i pozzi del dataset.
-# Accessibile solo agli utenti esperti.
-#
-# Uso:
-#   GET /pozzi/mineralizzazioni/cooccorrenza
-#   GET /pozzi/mineralizzazioni/cooccorrenza?prof_min=500&prof_max=2000
-# ==================================================
-@router.get("/mineralizzazioni/cooccorrenza", summary="Matrice co-occorrenza fluido ↔ litologia (solo esperti)")
+
+
+#gestione utente
+
+"""bug primaria/secondaria
+@router.get("/mineralizzazioni/cooccorrenza", summary="Matrice co-occorrenza fluido ↔ litologia standardizzata (solo esperti)")
 def cooccorrenza(
     prof_min: float | None = Query(default=None, description="Profondità minima (m)"),
     prof_max: float | None = Query(default=None, description="Profondità massima (m)"),
+    solo_primaria: bool = Query(default=False, description="..."),
     db: Session = Depends(get_db),
-    #current_user = Depends(require_esperto)
+    current_user = Depends(require_esperto),   # <-- unico endpoint protetto
 ):
-    """
-    Calcola la matrice di co-occorrenza tra tipo di fluido e litologia.
-    Per ogni coppia (fluido, litologia) conta quanti pozzi distinti
-    presentano entrambi nello stesso intervallo di profondità.
- 
-    Utile per rispondere a domande tipo:
-    "Quanti pozzi con gas attraversano litologie carbonatiche tra 1000 e 2500m?"
-    """
     query = (
         db.query(
             FluidoT.descrizione.label("fluido"),
-            Litologia.litologia.label("litologia"),
+            LitologiaStandard.litologia_standard.label("litologia"),
             func.count(func.distinct(Mineralizzazioni.key)).label("n_pozzi")
         )
         .join(Mineralizzazioni, FluidoT.fluido_t == Mineralizzazioni.tipo_fluido)
         .join(
-            Litologia,
-            (Litologia.key == Mineralizzazioni.key) &
-            (Litologia.daprof <= Mineralizzazioni.bottom) &
-            (Litologia.aprof  >= Mineralizzazioni.top)
+            LitologiaStandard,
+            (LitologiaStandard.key == Mineralizzazioni.key) &
+            (LitologiaStandard.daprof < Mineralizzazioni.bottom) &
+            (LitologiaStandard.aprof  > Mineralizzazioni.top)
         )
-        .filter(Mineralizzazioni.key.in_(db.query(Pozzo.key)))
     )
- 
+
+    if solo_primaria:
+        query = query.filter(LitologiaStandard.ruolo == "primaria")
     if prof_min is not None:
         query = query.filter(Mineralizzazioni.top >= prof_min)
     if prof_max is not None:
         query = query.filter(Mineralizzazioni.bottom <= prof_max)
- 
+
     results = (
         query
-        .group_by(FluidoT.descrizione, Litologia.litologia)
+        .group_by(FluidoT.descrizione, LitologiaStandard.litologia_standard)
         .order_by(func.count(func.distinct(Mineralizzazioni.key)).desc())
-        .limit(100)  # limite per evitare risposte enormi
+        .limit(100)
         .all()
     )
- 
-    return [
-        {
-            "fluido":    r.fluido,
-            "litologia": r.litologia,
-            "n_pozzi":   r.n_pozzi
-        }
-        for r in results
-    ]
 
-
-# ENDPOINT DETTAGLIO SINGOLO POZZO
+    return [{"fluido": r.fluido, "litologia": r.litologia, "n_pozzi": r.n_pozzi} for r in results]
 """
-@router.get("/{key}", summary="Dettaglio completo di un singolo pozzo")
-def dettaglio_pozzo(key: int, db: Session = Depends(get_db)):
-
-    pozzo = db.query(Pozzo).filter(Pozzo.key == key).first()
-    if not pozzo:
-        raise HTTPException(status_code=404, detail=f"Pozzo {key} non trovato")
-
-    regione   = db.query(Regioni).filter(Regioni.reg == pozzo.reg).first()
-    provincia = db.query(Province).filter(Province.prov == pozzo.prov).first()
-    comune    = db.query(Comuni).filter(Comuni.istat == pozzo.istat).first()
-    coord     = db.query(WellCoord).filter(WellCoord.key == key).first()
-
-    temperature = (
-        db.query(TempFin).filter(TempFin.key == key).order_by(TempFin.prof).all()
+"""
+@router.get("/mineralizzazioni/cooccorrenza", summary="Matrice co-occorrenza fluido ↔ litologia standardizzata (solo esperti)")
+def cooccorrenza(
+    prof_min: float | None = Query(default=None, description="Profondità minima (m)"),
+    prof_max: float | None = Query(default=None, description="Profondità massima (m)"),
+    ruolo: str = Query(default='tutte', description="tutte | primaria | subordinata"),
+    db: Session = Depends(get_db),
+    current_user = Depends(require_esperto),   # <-- unico endpoint protetto
+):
+    query = (
+        db.query(
+            FluidoT.descrizione.label("fluido"),
+            LitologiaStandard.litologia_standard.label("litologia"),
+            func.count(func.distinct(Mineralizzazioni.key)).label("n_pozzi")
+        )
+        .join(Mineralizzazioni, FluidoT.fluido_t == Mineralizzazioni.tipo_fluido)
+        .join(
+            LitologiaStandard,
+            (LitologiaStandard.key == Mineralizzazioni.key) &
+            (LitologiaStandard.daprof < Mineralizzazioni.bottom) &
+            (LitologiaStandard.aprof  > Mineralizzazioni.top)
+        )
     )
-    litologie = (
-        db.query(Litologia).filter(Litologia.key == key).order_by(Litologia.daprof).all()
-    )
-    gradienti = (
-        db.query(Grados).filter(Grados.key == key).order_by(Grados.daprof).all()
+
+    if ruolo != 'tutte':
+        query = query.filter(LitologiaStandard.ruolo == ruolo)
+    if prof_min is not None:
+        query = query.filter(Mineralizzazioni.top >= prof_min)
+    if prof_max is not None:
+        query = query.filter(Mineralizzazioni.bottom <= prof_max)
+    results = (
+        query
+        .group_by(FluidoT.descrizione, LitologiaStandard.litologia_standard)
+        .order_by(func.count(func.distinct(Mineralizzazioni.key)).desc())
+        .limit(100)
+        .all()
     )
 
-    dati_pressione = (
-         db.query(Dst).filter(Dst.key == key)
+    return [{"fluido": r.fluido, "litologia": r.litologia, "n_pozzi": r.n_pozzi} for r in results]
+"""
+@router.get("/mineralizzazioni/cooccorrenza", summary="Matrice co-occorrenza fluido ↔ litologia standardizzata (solo esperti)")
+def cooccorrenza(
+    prof_min: float | None = Query(default=None, description="Profondità minima (m)"),
+    prof_max: float | None = Query(default=None, description="Profondità massima (m)"),
+    ruolo: str = Query(default='tutte', description="tutte | primaria | subordinata"),
+    db: Session = Depends(get_db),
+    current_user = Depends(require_esperto),   # <-- unico endpoint protetto
+):
+    query = (
+        db.query(
+            FluidoT.descrizione.label("fluido"),
+            LitologiaStandard.litologia_standard.label("litologia"),
+            func.count(func.distinct(Mineralizzazioni.oid)).label("n_eventi")  # ← era .key / n_pozzi
+        )
+        .join(Mineralizzazioni, FluidoT.fluido_t == Mineralizzazioni.tipo_fluido)
+        #.join(Pozzo, Pozzo.key == Mineralizzazioni.key)
+        .join(
+            LitologiaStandard,
+            (LitologiaStandard.key == Mineralizzazioni.key) &
+            (LitologiaStandard.daprof < Mineralizzazioni.bottom) &
+            (LitologiaStandard.aprof  > Mineralizzazioni.top)
+        )
     )
+
+    if ruolo != 'tutte':
+        query = query.filter(LitologiaStandard.ruolo == ruolo)
+    if prof_min is not None:
+        query = query.filter(Mineralizzazioni.top >= prof_min)
+    if prof_max is not None:
+        query = query.filter(Mineralizzazioni.bottom <= prof_max)
+
+    results = (
+        query
+        .group_by(FluidoT.descrizione, LitologiaStandard.litologia_standard)
+        .order_by(func.count(func.distinct(Mineralizzazioni.oid)).desc())  # ← era .key
+        .limit(100)
+        .all()
+    )
+
+    return [{"fluido": r.fluido, "litologia": r.litologia, "n_eventi": r.n_eventi} for r in results]  # ← era n_pozzi
+
+@router.get("/litologie/termini", summary="Lista termini litologici standardizzati con conteggio")
+def termini_litologici(
+    prof_min: float | None = Query(default=None),
+    prof_max: float | None = Query(default=None),
+    ruolo: str | None = Query(default=None, description="primaria | subordinata | None = entrambi"),
+    db: Session = Depends(get_db),
+):
+    # 1. Aggiungiamo il JOIN con InfoPozzi alla query base
+    base_query = db.query(LitologiaStandard).join(
+        Pozzo, 
+        Pozzo.key == LitologiaStandard.key
+    )
+    # 1. Query base (senza group by) per i filtri
+    #base_query = db.query(LitologiaStandard)
+    if prof_min is not None:
+        base_query = base_query.filter(LitologiaStandard.daprof >= prof_min)
+    if prof_max is not None:
+        base_query = base_query.filter(LitologiaStandard.aprof <= prof_max)
+    if ruolo is not None:
+        base_query = base_query.filter(LitologiaStandard.ruolo == ruolo)
+
+    # 2. Calcola il totale REALE dei pozzi univoci che matchano i filtri
+    totale_pozzi_univoci = base_query.with_entities(func.count(func.distinct(LitologiaStandard.key))).scalar()
+
+    # 3. Calcola i raggruppamenti per termine come facevi prima
+    """q_group = base_query.with_entities(
+        LitologiaStandard.litologia_standard,
+        func.count(func.distinct(LitologiaStandard.key)).label("n_pozzi"),
+        func.count(LitologiaStandard.oid).label("n_strati")
+    ).group_by(
+        LitologiaStandard.litologia_standard
+    ).order_by(
+        func.count(func.distinct(LitologiaStandard.key)).desc()
+    ).all()
+
+    # 4. Restituisci tutto insieme
+    return {
+        "totale_pozzi_univoci": totale_pozzi_univoci,
+        "dati": [
+            {
+                "termine": r.litologia_standard,
+                "n_pozzi": r.n_pozzi,
+                "n_strati": r.n_strati,
+            }
+            for r in q_group
+        ]
+    }"""
+    # 3. Calcola i raggruppamenti per termine come facevi prima
+    q_group = base_query.with_entities(
+        LitologiaStandard.litologia_standard,
+        func.count(func.distinct(LitologiaStandard.key)).label("n_pozzi"),
+        func.count(LitologiaStandard.key).label("n_strati")
+    ).group_by(
+        LitologiaStandard.litologia_standard
+    ).order_by(
+        func.count(LitologiaStandard.oid).desc()  # ordina per n_strati, coerente col nuovo criterio
+    ).all()
+
+    totale_strati = sum(r.n_strati for r in q_group)
 
     return {
-        "anagrafica": {
-            "key":        pozzo.key,
-            "nome":       pozzo.nome,
-            "proprietar": pozzo.proprietar,
-            "datacomp":   pozzo.datacomp,
-            "prof":       pozzo.prof,
-            "quota":      pozzo.quota,
-            "entitam":    pozzo.entitam,
-            "camploc":    pozzo.camploc,
-            "locgeo":     pozzo.locgeo,
-        },
-        "posizione": {
-            "lat":       pozzo.lat_,
-            "lon":       pozzo.lon_,
-            "regione":   regione.nome   if regione   else None,
-            "provincia": provincia.nome if provincia else None,
-            "comune":    comune.nome    if comune    else None,
-        },
-        "classificazione": {
-            "tipo":  get_descrizione(db, Tipi,  Tipi.tipo,    pozzo.tipo),
-            "scopo": get_descrizione(db, Scopi, Scopi.scopo,  pozzo.scopo),
-            "uso":   get_descrizione(db, Usi,   Usi.uso,      pozzo.uso),
-            "stato": get_descrizione(db, Stato, Stato.stato,  pozzo.stato),
-            "esito": get_descrizione(db, Esiti, Esiti.esitom, pozzo.esitom),
-        },
-        "temperature": [
+        "totale_pozzi_univoci": totale_pozzi_univoci,
+        "totale_strati": totale_strati,
+        "dati": [
             {
-                "data":   t.data,
-                "prof":   t.prof,
-                "temp":   t.temp,
-                "tcirc":  t.tcirc,
-                #"tstop":  t.tstop,
-                #"metodo": get_descrizione(db, Metodi, Metodi.tipo_metodo, t.metodo),
-                "metodo": get_descrizione(db, Metodi, Metodi.tipo_metodo),
+                "termine": r.litologia_standard,
+                "n_pozzi": r.n_pozzi,     # utile per tooltip, ma NON per la percentuale
+                "n_strati": r.n_strati,   # base corretta per la percentuale
             }
-            for t in temperature
-        ],
-        "litologia": [
-            {"da": l.daprof, "a": l.aprof, "litologia": l.litologia}
-            for l in litologie
-        ],
-        "gradiente_geotermico": [
-            {"da": g.daprof, "a": g.aprof, "grad": g.grad, "condm": g.condm}
-            for g in gradienti
-        ],
-        "dati_pressione": [
-            {"da": dp.bottom, "a": dp.top}
-            for dp in dati_pressione
-        ],
-        "coordinate_sistemi_riferimento": {
-            "lat_wgs84": coord.lat    if coord else None,
-            "lon_wgs84": coord.lon    if coord else None,
-            "lat_gd":    coord.lat_gd if coord else None,
-            "lon_gd":    coord.lon_gd if coord else None,
-        } if coord else None,
+            for r in q_group
+        ]
     }
-"""
+
+@router.get("/litologie/filtro", summary="Pozzi che attraversano i termini litologici selezionati")
+def filtro_litologia(
+    termine: list[str] = Query(..., description="Uno o più termini standardizzati es. CALCARE, ARGILLA"),
+    prof_min: float | None = Query(default=None),
+    prof_max: float | None = Query(default=None),
+    ruolo: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    q = db.query(func.distinct(LitologiaStandard.key)).filter(
+        LitologiaStandard.litologia_standard.in_(termine)
+    )
+
+    if prof_min is not None:
+        q = q.filter(LitologiaStandard.daprof >= prof_min)
+    if prof_max is not None:
+        q = q.filter(LitologiaStandard.aprof <= prof_max)
+    if ruolo is not None:
+        q = q.filter(LitologiaStandard.ruolo == ruolo)
+
+    keys = [row[0] for row in q.all()]
+
+    return {
+        "termini": termine,
+        "n_pozzi": len(keys),
+        "keys": keys,
+    }
+
+@router.get("/debug/check-orfani")
+def check_orfani(db: Session = Depends(get_db)):
+    orfani_mineral = db.query(func.count(func.distinct(Mineralizzazioni.key))).filter(
+        ~Mineralizzazioni.key.in_(db.query(Pozzo.key))
+    ).scalar()
+
+    orfani_lito = db.query(func.count(func.distinct(LitologiaStandard.key))).filter(
+        ~LitologiaStandard.key.in_(db.query(Pozzo.key))
+    ).scalar()
+
+    return {
+        "orfani_mineralizzazioni": orfani_mineral,
+        "orfani_litologia_standard": orfani_lito
+    }

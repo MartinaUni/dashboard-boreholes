@@ -1,0 +1,1602 @@
+<template>
+  <div class="advanced-filter">
+
+    <!-- HEADER -->
+    <div class="af-header">
+      <div class="af-title-row">
+        <span class="af-title">Advanced Filter</span>
+        <span class="af-subtitle">Filtra per litologia e tipo di mineralizzazione</span>
+      </div>
+      <div class="af-badge" v-if="pozziSelezionati !== null">
+        {{ pozziSelezionati }} pozzi selezionati
+      </div>
+    </div>
+
+    <!-- ====== FILTRO PROFONDITÀ GLOBALE ====== -->
+    <div class="global-depth-bar">
+      <div class="depth-info">
+        <span class="depth-title">INTERVALLO DI PROFONDITÀ UNICO (m)</span>
+        <div class="depth-inputs">
+          <span>Da</span>
+          <input type="number" v-model.number="profMin" class="depth-input" min="0" max="5000" step="50">
+          <span>a</span>
+          <input type="number" v-model.number="profMax" class="depth-input" min="0" max="5000" step="50">
+          <span class="depth-unit">m</span>
+        </div>
+      </div>
+
+      <div class="dual-slider-container">
+        <!-- Barra colorata di sfondo dinamica -->
+        <div 
+          class="slider-track" 
+          :style="{
+            left: (profMin / 5000 * 100) + '%',
+            width: ((profMax - profMin) / 5000 * 100) + '%'
+          }"
+        ></div>
+        
+        <input 
+          type="range" 
+          v-model.number="profMin" 
+          min="0" 
+          max="5000" 
+          step="50" 
+          class="slider-range"
+          :style="{ zIndex: profMin > 4500 ? '5' : '3' }"
+        >
+        <input 
+          type="range" 
+          v-model.number="profMax" 
+          min="0" 
+          max="5000" 
+          step="50" 
+          class="slider-range"
+          style="z-index: 4;"
+        >
+      </div>
+    </div>
+
+    <!-- CORPO A TRE COLONNE -->
+    <div class="af-body">
+
+      <!-- ====== COLONNA SINISTRA: LITOLOGIA ====== -->
+      <div class="af-panel panel-lito">
+        <div class="panel-header lito-header">
+          <span class="panel-title">Litologia</span>
+        </div>
+
+        <div class="macro-label">TERMINI LITOLOGICI</div>
+        <div class="termini-grid">
+          <div
+            v-for="t in terminiLito"
+            :key="t.termine"
+            :class="['termine-chip', { selected: selectedLito.includes(t.termine) }]"
+            @click="toggleLito(t.termine)"
+          >
+            <span class="termine-nome">{{ t.termine }}</span>
+            <span class="termine-stats">{{ t.n_pozzi }} pozzi · {{ t.n_strati }} strati</span>
+          </div>
+        </div>
+
+        <p class="lito-note">
+          Seleziona uno o più termini litologici per filtrare i pozzi nell'intervallo di profondità globale.
+        </p>
+      </div>
+
+      <!-- ====== COLONNA CENTRALE: MINERALIZZAZIONE ====== -->
+      <div class="af-panel panel-min">
+        <div class="panel-header min-header">
+          <span class="panel-title">Mineralizzazione</span>
+          <span class="panel-badge blue" v-if="totaleMineralizzazioni !== null">{{ totaleMineralizzazioni }} eventi</span>
+        </div>
+
+        <!-- Tipi di fluido -->
+        <div class="macro-label">TIPO DI FLUIDO</div>
+        <div class="fluido-list">
+          <div
+            v-for="fluido in fluidiData"
+            :key="fluido.codice"
+            :class="['fluido-chip', { selected: selectedFluidi.includes(fluido.codice) }]"
+            :style="selectedFluidi.includes(fluido.codice) ? { background: getFluidoColor(fluido.codice) + '22', borderColor: getFluidoColor(fluido.codice) } : {}"
+            @click="toggleFluido(fluido.codice)"
+          >
+            <span class="fluido-dot" :style="{ background: getFluidoColor(fluido.codice) }"></span>
+            <span class="fluido-nome">{{ fluido.fluido }}</span>
+            <span class="fluido-meta">tipo {{ fluido.codice }}</span>
+            <span class="fluido-eventi">{{ fluido.n_eventi }} ev.</span>
+          </div>
+        </div>
+
+        <!-- Istogramma distribuzione per profondità -->
+        <div class="macro-label" style="margin-top: 16px;">DISTRIBUZIONE PER PROFONDITÀ</div>
+        <div class="histogram-wrapper">
+          <svg ref="histSvg" width="100%" height="100"></svg>
+        </div>
+        <div class="histogram-labels">
+          <span>0 m</span>
+          <span>500</span>
+          <span>1000</span>
+          <span>1500</span>
+          <span>2000</span>
+          <span>2500 m</span>
+        </div>
+      </div>
+
+      <!-- ====== COLONNA DESTRA: MATRICE ====== -->
+      <div class="af-panel panel-matrix">
+        <div class="panel-header matrix-header">
+          <span class="panel-title">Correlazione Fluido ↔ Litologia</span>
+          <span class="panel-badge outline">tutti i pozzi</span>
+        </div>
+
+        <p class="matrix-desc">
+          Quante volte ciascun tipo di fluido è stato incontrato in ciascuna litologia.
+        </p>
+
+        <!-- Tabella matrice -->
+        <div class="matrix-scroll" v-if="matrice.length">
+          <table class="matrix-table">
+            <thead>
+              <tr>
+                <th class="lito-col">LITOLOGIA</th>
+                <th v-for="f in colonneMatrice" :key="f" class="fluido-col">
+                  <span class="fluido-dot-small" :style="{ background: getFluidoColorByName(f) }"></span>
+                  {{ f.toUpperCase() }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in righeMatrice" :key="row.lito">
+                <td class="lito-name">
+                  <span class="macro-dot">{{ getMacroIcon(row.lito) }}</span>
+                  {{ row.lito }}
+                </td>
+                <td
+                  v-for="f in colonneMatrice"
+                  :key="f"
+                  class="matrix-cell"
+                  :class="getCellClass(row[f])"
+                >
+                  <span v-if="row[f]">{{ row[f] }}</span>
+                  <span v-else class="cell-empty">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div v-else class="matrix-loading">Caricamento matrice...</div>
+
+        <!-- Legenda intensità -->
+        <div class="intensity-legend">
+          <span class="legend-title">LEGENDA INTENSITÀ</span>
+          <div class="legend-chips">
+            <span class="intensity-chip i1">1</span>
+            <span class="intensity-chip i5">1-5</span>
+            <span class="intensity-chip i25">6-25</span>
+            <span class="intensity-chip i48">26-48</span>
+            <span class="legend-note">n° eventi co-occorrenti</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ====== BARRA INFERIORE ====== -->
+    <div class="af-footer">
+      <div class="footer-left">
+        <span class="footer-count">
+          Pozzi selezionati: <strong>{{ pozziSelezionati ?? '–' }}</strong> / {{ totaleDataset }} totali
+        </span>
+      </div>
+
+      <div class="footer-chips">
+        <span
+          v-for="chip in filtriAttivi"
+          :key="chip.label"
+          class="active-chip"
+          :style="{ borderColor: chip.color || '#999', color: chip.color || '#666' }"
+        >
+          {{ chip.label }}
+        </span>
+      </div>
+
+      <div class="footer-actions">
+        <button class="btn-reset" @click="resetFiltri">Reset</button>
+        <button class="btn-apply" @click="applicaFiltri">Applica → Mappa</button>
+      </div>
+    </div>
+
+  </div>
+</template>
+
+<!--
+<script setup>
+import { ref, computed, onMounted, watch, nextTick } from 'vue'
+
+const emit = defineEmits(['applica-filtri'])
+
+const API_BASE = 'http://127.0.0.1:8000'
+
+
+const terminiLito = ref([])
+
+async function fetchTerminiLito() {
+  try {
+    const params = new URLSearchParams()
+    if (litoProfMin.value > 0) params.append('prof_min', litoProfMin.value)
+    if (litoProfMax.value < 5000) params.append('prof_max', litoProfMax.value)
+
+    const res = await fetch(`${API_BASE}/pozzi/litologie/termini?${params}`)
+    if (!res.ok) return
+    terminiLito.value = await res.json()
+    console.log('✅ Termini litologici:', terminiLito.value.length)
+  } catch (e) {
+    console.error('Errore fetch termini:', e)
+  }
+}
+
+// Aggiungi nel watcher:
+watch([litoProfMin, litoProfMax], async () => {
+  await fetchTerminiLito()
+  await aggiornaPozziSelezionati()
+})
+
+// E nel onMounted:
+onMounted(async () => {
+  await fetchFluidi()
+  await fetchTerminiLito()
+  await fetchCooccorrenza()
+  await buildHistogram()
+  await aggiornaPozziSelezionati()
+})
+
+
+
+// ============ COLORI FLUIDI ============
+
+const FLUIDO_COLORS = {
+  1: '#4fc3f7',  // Acqua - azzurro
+  2: '#81c784',  // Acqua salina - verde
+  3: '#ef5350',  // Vapore - rosso
+  4: '#8d6e63',  // CO2 - marrone
+  5: '#ffa726',  // Gas - arancione
+  6: '#ab47bc',  // H2S - viola
+  7: '#26c6da',  // Acqua salata - ciano
+  8: '#d4e157',  // Altro - lime
+}
+
+function getFluidoColor(codice) {
+  return FLUIDO_COLORS[codice] || '#999'
+}
+
+function getFluidoColorByName(nome) {
+  const fluido = fluidiData.value.find(f => f.fluido === nome)
+  return fluido ? getFluidoColor(fluido.codice) : '#999'
+}
+
+// ============ CALCOLO CONTEGGIO LITOLOGIE ============
+
+const litoConteggioMap = computed(() => {
+  const map = {}
+  if (!cooccorrenza.value.length) return map
+
+  macrocategorie.forEach(macro => {
+    let count = 0
+    cooccorrenza.value.forEach(row => {
+      if (row.litologia && macro.termini.some(t =>
+        row.litologia.toUpperCase().includes(t)
+      )) {
+        count += row.n_pozzi
+      }
+    })
+    map[macro.id] = count
+  })
+  return map
+})
+
+// ============ MATRICE CO-OCCORRENZA ============
+
+const colonneMatrice = computed(() => {
+  const fluidiNomi = [...new Set(cooccorrenza.value.map(r => r.fluido))]
+  // Mostra solo i primi 4 fluidi più comuni per leggibilità
+  return fluidiNomi.slice(0, 4)
+})
+
+const righeMatrice = computed(() => {
+  if (!cooccorrenza.value.length) return []
+
+  const righe = macrocategorie.map(macro => {
+    const row = { lito: macro.nome }
+    colonneMatrice.value.forEach(fluido => {
+      let total = 0
+      cooccorrenza.value.forEach(entry => {
+        if (
+          entry.fluido === fluido &&
+          entry.litologia &&
+          macro.termini.some(t => entry.litologia.toUpperCase().includes(t))
+        ) {
+          total += entry.n_pozzi
+        }
+      })
+      row[fluido] = total > 0 ? total : null
+    })
+    return row
+  })
+
+  return righe
+})
+
+const matrice = computed(() => righeMatrice.value)
+
+function getCellClass(value) {
+  if (!value) return 'cell-zero'
+  if (value <= 5)  return 'cell-low'
+  if (value <= 25) return 'cell-mid'
+  return 'cell-high'
+}
+
+function getMacroIcon(nome) {
+  const m = macrocategorie.find(m => m.nome === nome)
+  return m?.icon || '•'
+}
+
+// ============ NOTA TESI (generata dalla matrice) ============
+
+const tesiNote = computed(() => {
+  if (!righeMatrice.value.length || !colonneMatrice.value.length) return null
+
+  // Trova la combinazione fluido-litologia con più occorrenze
+  let maxVal = 0
+  let maxFluido = ''
+  let maxLito = ''
+
+  righeMatrice.value.forEach(row => {
+    colonneMatrice.value.forEach(f => {
+      if (row[f] && row[f] > maxVal) {
+        maxVal = row[f]
+        maxFluido = f
+        maxLito = row.lito
+      }
+    })
+  })
+
+  if (!maxFluido) return null
+
+  return `Il <strong>${maxFluido.toLowerCase()}</strong> si concentra prevalentemente in litologie <strong>${maxLito.toLowerCase()}he</strong> (${maxVal} eventi), confermando il ruolo di queste formazioni come reservoir geotermico preferenziale nel dataset analizzato.`
+})
+
+// ============ FILTRI ATTIVI ============
+
+const filtriAttivi = computed(() => {
+  const chips = []
+
+  selectedLito.value.forEach(id => {
+    const m = macrocategorie.find(m => m.id === id)
+    if (m) chips.push({ label: m.nome, color: '#8d6748' })
+  })
+
+  selectedFluidi.value.forEach(cod => {
+    const f = fluidiData.value.find(f => f.codice === cod)
+    if (f) chips.push({ label: f.fluido, color: getFluidoColor(cod) })
+  })
+
+  if (litoProfMin.value > 0 || litoProfMax.value < 5000) {
+    chips.push({ label: `${litoProfMin.value}–${litoProfMax.value} m`, color: '#666' })
+  }
+
+  return chips
+})
+
+// ============ TOTALE MINERALIZZAZIONI (filtrate) ============
+
+const totaleFiltratoMineralizzazioni = computed(() => {
+  if (!selectedFluidi.value.length) return totaleMineralizzazioni.value
+  return fluidiData.value
+    .filter(f => selectedFluidi.value.includes(f.codice))
+    .reduce((sum, f) => sum + f.n_eventi, 0)
+})
+
+// ============ TOGGLE ============
+
+function toggleLito(id) {
+  const idx = selectedLito.value.indexOf(id)
+  if (idx === -1) selectedLito.value.push(id)
+  else selectedLito.value.splice(idx, 1)
+  aggiornaPozziSelezionati()
+}
+
+function toggleFluido(cod) {
+  const idx = selectedFluidi.value.indexOf(cod)
+  if (idx === -1) selectedFluidi.value.push(cod)
+  else selectedFluidi.value.splice(idx, 1)
+  aggiornaPozziSelezionati()
+}
+
+// ============ FETCH ============
+
+async function fetchFluidi() {
+  try {
+    const res = await fetch(`${API_BASE}/pozzi/mineralizzazioni/tipi`)
+    if (!res.ok) return
+    const data = await res.json()
+    fluidiData.value = data
+    totaleMineralizzazioni.value = data.reduce((s, f) => s + f.n_eventi, 0)
+  } catch (e) {
+    console.error('Errore fetch fluidi:', e)
+  }
+}
+
+async function fetchCooccorrenza() {
+  try {
+    const params = new URLSearchParams({
+      prof_min: minProfMin.value,
+      prof_max: minProfMax.value,
+    })
+    const res = await fetch(`${API_BASE}/pozzi/mineralizzazioni/cooccorrenza?${params}`)
+    if (!res.ok) return
+    cooccorrenza.value = await res.json()
+  } catch (e) {
+    console.error('Errore fetch co-occorrenza:', e)
+  }
+}
+
+async function aggiornaPozziSelezionati() {
+  try {
+    const params = new URLSearchParams()
+    if (selectedFluidi.value.length === 1) {
+      params.append('tipo_fluido', selectedFluidi.value[0])
+    }
+    params.append('prof_min', minProfMin.value)
+    params.append('prof_max', minProfMax.value)
+
+    const res = await fetch(`${API_BASE}/pozzi/mineralizzazioni?${params}`)
+    if (!res.ok) return
+    const data = await res.json()
+
+    // Filtra per litologia se selezionata (lato client)
+    const keys = [...new Set(data.map(d => d.key))]
+    pozziSelezionati.value = keys.length
+  } catch (e) {
+    console.error('Errore aggiornamento pozzi:', e)
+  }
+}
+
+// ============ ISTOGRAMMA PROFONDITÀ ============
+
+async function buildHistogram() {
+  await nextTick()
+  const svg = histSvg.value
+  if (!svg) return
+
+  try {
+    const params = new URLSearchParams({ prof_min: minProfMin.value, prof_max: minProfMax.value })
+    const res = await fetch(`${API_BASE}/pozzi/mineralizzazioni?${params}`)
+    if (!res.ok) return
+    const data = await res.json()
+
+    const bins = [0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500]
+    const counts = new Array(bins.length - 1).fill(0)
+    const vaporeCount = new Array(bins.length - 1).fill(0)
+    const gasCount    = new Array(bins.length - 1).fill(0)
+
+    data.forEach(d => {
+      const mid = (d.top + d.bottom) / 2
+      for (let i = 0; i < bins.length - 1; i++) {
+        if (mid >= bins[i] && mid < bins[i + 1]) {
+          counts[i]++
+          if (d.tipo_fluido === 3) vaporeCount[i]++
+          if (d.tipo_fluido === 5) gasCount[i]++
+          break
+        }
+      }
+    })
+
+    const W = svg.clientWidth || 280
+    const H = 90
+    const maxCount = Math.max(...counts, 1)
+    const bw = W / counts.length
+
+    let svgContent = ''
+    counts.forEach((c, i) => {
+      const h = (c / maxCount) * (H - 15)
+      const x = i * bw + 1
+      const y = H - h - 5
+
+      // Barra totale
+      svgContent += `<rect x="${x}" y="${y}" width="${bw - 2}" height="${h}" fill="#ef535055" rx="2"/>`
+
+      // Strato vapore
+      const vh = (vaporeCount[i] / maxCount) * (H - 15)
+      svgContent += `<rect x="${x}" y="${H - vh - 5}" width="${bw - 2}" height="${vh}" fill="#ef5350" rx="2"/>`
+
+      // Strato gas
+      const gh = (gasCount[i] / maxCount) * (H - 15)
+      svgContent += `<rect x="${x}" y="${H - gh - 5}" width="${bw - 2}" height="${gh}" fill="#ffa726" rx="2"/>`
+    })
+
+    // Legenda
+    svgContent += `<rect x="5" y="${H - 2}" width="8" height="4" fill="#ef5350"/><text x="15" y="${H + 1}" font-size="8" fill="#aaa">Vapore</text>`
+    svgContent += `<rect x="55" y="${H - 2}" width="8" height="4" fill="#ffa726"/><text x="65" y="${H + 1}" font-size="8" fill="#aaa">Gas</text>`
+
+    svg.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H + 10}">${svgContent}</svg>`
+  } catch (e) {
+    console.error('Errore istogramma:', e)
+  }
+}
+
+// ============ APPLICA / RESET ============
+
+function applicaFiltri() {
+  emit('applica-filtri', {
+    fluidi: selectedFluidi.value,
+    lito: selectedLito.value,
+    profMin: minProfMin.value,
+    profMax: minProfMax.value,
+  })
+}
+
+function resetFiltri() {
+  selectedLito.value   = []
+  selectedFluidi.value = []
+  litoProfMin.value = 500
+  litoProfMax.value = 2500
+  minProfMin.value  = 500
+  minProfMax.value  = 2500
+  pozziSelezionati.value = null
+}
+
+// ============ WATCHERS ============
+
+watch([minProfMin, minProfMax], async () => {
+  await fetchCooccorrenza()
+  await buildHistogram()
+  await aggiornaPozziSelezionati()
+})
+
+// ============ MOUNT ============
+
+onMounted(async () => {
+  await fetchFluidi()
+  await fetchCooccorrenza()
+  await buildHistogram()
+  await aggiornaPozziSelezionati()
+})
+</script>
+
+-->
+<script setup>
+import { ref, computed, onMounted, watch, nextTick } from 'vue'
+
+const emit = defineEmits(['applica-filtri'])
+const API_BASE = 'http://127.0.0.1:8000'
+
+// ============ STATE UNIFICATO ============
+const profMin = ref(0)
+const profMax = ref(5000)
+
+const selectedLito   = ref([])
+const selectedFluidi = ref([])
+
+const terminiLito  = ref([])
+const fluidiData   = ref([])
+const cooccorrenza = ref([])
+
+const pozziSelezionati       = ref(null)
+const totaleMineralizzazioni = ref(null)
+const totaleDataset          = ref(160)
+const histSvg                = ref(null)
+
+// ============ COLORI FLUIDI ============
+const FLUIDO_COLORS = {
+  1: '#4fc3f7',
+  2: '#81c784',
+  3: '#ef5350',
+  4: '#8d6e63',
+  5: '#ffa726',
+  6: '#ab47bc',
+  7: '#26c6da',
+  8: '#d4e157',
+}
+
+
+
+
+function getFluidoColor(codice) {
+  return FLUIDO_COLORS[codice] || '#999'
+}
+
+function getFluidoColorByName(nome) {
+  const fluido = fluidiData.value.find(f => f.fluido === nome)
+  return fluido ? getFluidoColor(fluido.codice) : '#999'
+}
+
+// ============ MATRICE CO-OCCORRENZA ============
+const colonneMatrice = computed(() => {
+  const fluidiNomi = [...new Set(cooccorrenza.value.map(r => r.fluido))]
+  return fluidiNomi.slice(0, 4)
+})
+
+const righeMatrice = computed(() => {
+  if (!cooccorrenza.value.length || !terminiLito.value.length) return []
+
+  return terminiLito.value.map(t => {
+    const row = { lito: t.termine }
+    colonneMatrice.value.forEach(fluido => {
+      const entry = cooccorrenza.value.find(
+        e => e.fluido === fluido && e.litologia === t.termine
+      )
+      row[fluido] = entry ? entry.n_pozzi : null
+    })
+    return row
+  })
+})
+
+const matrice = computed(() => righeMatrice.value)
+
+function getCellClass(value) {
+  if (!value) return 'cell-zero'
+  if (value <= 5)  return 'cell-low'
+  if (value <= 25) return 'cell-mid'
+  return 'cell-high'
+}
+
+function getMacroIcon() { return '•' }
+
+// ============ FILTRI ATTIVI ============
+const filtriAttivi = computed(() => {
+  const chips = []
+  selectedLito.value.forEach(termine => {
+    chips.push({ label: termine, color: '#8d6748' })
+  })
+  selectedFluidi.value.forEach(cod => {
+    const f = fluidiData.value.find(f => f.codice === cod)
+    if (f) chips.push({ label: f.fluido, color: getFluidoColor(cod) })
+  })
+  if (profMin.value > 0 || profMax.value < 5000) {
+    chips.push({ label: `${profMin.value}–${profMax.value} m`, color: '#666' })
+  }
+  return chips
+})
+
+// ============ TOGGLE ============
+function toggleLito(termine) {
+  const idx = selectedLito.value.indexOf(termine)
+  if (idx === -1) selectedLito.value.push(termine)
+  else selectedLito.value.splice(idx, 1)
+  aggiornaPozziSelezionati()
+}
+
+function toggleFluido(cod) {
+  const idx = selectedFluidi.value.indexOf(cod)
+  if (idx === -1) selectedFluidi.value.push(cod)
+  else selectedFluidi.value.splice(idx, 1)
+  aggiornaPozziSelezionati()
+}
+
+// ============ FETCH ============
+async function fetchTerminiLito() {
+  try {
+    const params = new URLSearchParams()
+    if (profMin.value > 0) params.append('prof_min', profMin.value)
+    if (profMax.value < 5000) params.append('prof_max', profMax.value)
+    const res = await fetch(`${API_BASE}/pozzi/litologie/termini?${params}`)
+    if (!res.ok) return
+    terminiLito.value = await res.json()
+  } catch (e) {
+    console.error('Errore fetch termini:', e)
+  }
+}
+
+async function fetchFluidi() {
+  try {
+    const res = await fetch(`${API_BASE}/pozzi/mineralizzazioni/tipi`)
+    if (!res.ok) return
+    const data = await res.json()
+    fluidiData.value = data
+    totaleMineralizzazioni.value = data.reduce((s, f) => s + f.n_eventi, 0)
+  } catch (e) {
+    console.error('Errore fetch fluidi:', e)
+  }
+}
+
+async function fetchCooccorrenza() {
+  try {
+    const params = new URLSearchParams()
+    if (profMin.value > 0) params.append('prof_min', profMin.value)
+    if (profMax.value < 5000) params.append('prof_max', profMax.value)
+    const res = await fetch(`${API_BASE}/pozzi/mineralizzazioni/cooccorrenza?${params}`)
+    if (!res.ok) return
+    cooccorrenza.value = await res.json()
+  } catch (e) {
+    console.error('Errore fetch co-occorrenza:', e)
+  }
+}
+
+async function aggiornaPozziSelezionati() {
+  try {
+    const params = new URLSearchParams()
+    if (selectedFluidi.value.length === 1) {
+      params.append('tipo_fluido', selectedFluidi.value[0])
+    }
+    if (profMin.value > 0) params.append('prof_min', profMin.value)
+    if (profMax.value < 5000) params.append('prof_max', profMax.value)
+    
+    selectedLito.value.forEach(termine => {
+      params.append('termine_lito', termine)
+    })
+
+    const res = await fetch(`${API_BASE}/pozzi/mappa/avanzata?${params}`)
+    if (!res.ok) return
+    const data = await res.json()
+    pozziSelezionati.value = data.length
+  } catch (e) {
+    console.error('Errore aggiornamento pozzi:', e)
+  }
+}
+
+async function buildHistogram() {
+  await nextTick()
+  const svg = histSvg.value
+  if (!svg) return
+  try {
+    const params = new URLSearchParams()
+    if (profMin.value > 0) params.append('prof_min', profMin.value)
+    if (profMax.value < 5000) params.append('prof_max', profMax.value)
+    const res = await fetch(`${API_BASE}/pozzi/mineralizzazioni?${params}`)
+    if (!res.ok) return
+    const data = await res.json()
+
+    const bins = [0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500]
+    const counts      = new Array(bins.length - 1).fill(0)
+    const vaporeCount = new Array(bins.length - 1).fill(0)
+    const gasCount    = new Array(bins.length - 1).fill(0)
+
+    data.forEach(d => {
+      const mid = (d.top + d.bottom) / 2
+      for (let i = 0; i < bins.length - 1; i++) {
+        if (mid >= bins[i] && mid < bins[i + 1]) {
+          counts[i]++
+          if (d.tipo_fluido === 3) vaporeCount[i]++
+          if (d.tipo_fluido === 5) gasCount[i]++
+          break
+        }
+      }
+    })
+
+    const W = svg.clientWidth || 280
+    const H = 90
+    const maxCount = Math.max(...counts, 1)
+    const bw = W / counts.length
+    let svgContent = ''
+
+    counts.forEach((c, i) => {
+      const h  = (c / maxCount) * (H - 15)
+      const vh = (vaporeCount[i] / maxCount) * (H - 15)
+      const gh = (gasCount[i] / maxCount) * (H - 15)
+      const x  = i * bw + 1
+
+      svgContent += `<rect x="${x}" y="${H - h - 5}" width="${bw - 2}" height="${h}" fill="#ef535055" rx="2"/>`
+      svgContent += `<rect x="${x}" y="${H - vh - 5}" width="${bw - 2}" height="${vh}" fill="#ef5350" rx="2"/>`
+      svgContent += `<rect x="${x}" y="${H - gh - 5}" width="${bw - 2}" height="${gh}" fill="#ffa726" rx="2"/>`
+    })
+
+    svgContent += `<rect x="5" y="${H - 2}" width="8" height="4" fill="#ef5350"/><text x="15" y="${H + 1}" font-size="8" fill="#aaa">Vapore</text>`
+    svgContent += `<rect x="55" y="${H - 2}" width="8" height="4" fill="#ffa726"/><text x="65" y="${H + 1}" font-size="8" fill="#aaa">Gas</text>`
+    svg.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H + 10}">${svgContent}</svg>`
+  } catch (e) {
+    console.error('Errore istogramma:', e)
+  }
+}
+
+// ============ APPLICA / RESET ============
+function applicaFiltri() {
+  emit('applica-filtri', {
+    fluidi: selectedFluidi.value,
+    lito: selectedLito.value,
+    profMin: profMin.value,
+    profMax: profMax.value,
+  })
+}
+
+function resetFiltri() {
+  selectedLito.value   = []
+  selectedFluidi.value = []
+  profMin.value = 0
+  profMax.value = 5000
+  pozziSelezionati.value = null
+}
+
+// ============ WATCHERS ============
+// Controllo incrociato dei limiti per evitare sovrapposizioni
+watch(profMin, (val) => {
+  if (val >= profMax.value) profMin.value = profMax.value - 50
+})
+
+watch(profMax, (val) => {
+  if (val <= profMin.value) profMax.value = profMin.value + 50
+})
+
+// Ricarica tutti i dati quando cambia la profondità o la litologia
+watch([profMin, profMax], async () => {
+  await fetchTerminiLito()
+  await fetchCooccorrenza()
+  await buildHistogram()
+  await aggiornaPozziSelezionati()
+})
+
+// ============ MOUNT ============
+onMounted(async () => {
+  await fetchFluidi()
+  await fetchTerminiLito()
+  await fetchCooccorrenza()
+  await buildHistogram()
+  await aggiornaPozziSelezionati()
+})
+</script>
+<style scoped>
+/* ====== LAYOUT GENERALE ====== */
+.advanced-filter {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #f0ebe2;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+  overflow: hidden;
+}
+
+/* ====== HEADER ====== */
+.af-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 20px;
+  background: #e8dcc8;
+  border-bottom: 1px solid #c8b89a;
+  flex-shrink: 0;
+}
+
+.af-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #3d3020;
+  margin-right: 10px;
+}
+
+.af-subtitle {
+  font-size: 12px;
+  color: #888;
+  font-style: italic;
+}
+
+.af-badge {
+  background: #2e7d32;
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 14px;
+  border-radius: 20px;
+}
+
+/* ====== BODY ====== */
+.af-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+  padding: 12px;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* ====== PANNELLI ====== */
+.af-panel {
+  background: white;
+  border-radius: 10px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  border: 1px solid #e0d8cc;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #f0e8dc;
+}
+
+.panel-icon { font-size: 16px; }
+
+.panel-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #3d3020;
+  flex: 1;
+}
+
+.panel-badge {
+  background: #e8dcc8;
+  color: #7d6b5a;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  text-transform: uppercase;
+}
+
+.panel-badge.blue {
+  background: #e3f2fd;
+  color: #1565c0;
+}
+
+.panel-badge.outline {
+  background: transparent;
+  border: 1px solid #ccc;
+  color: #888;
+}
+
+/* ====== SLIDER PROFONDITÀ ====== */
+.depth-section {
+  margin-bottom: 14px;
+}
+
+.depth-label {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #888;
+  margin-bottom: 6px;
+}
+
+.depth-inputs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 6px;
+}
+
+.depth-input {
+  width: 60px;
+  padding: 3px 6px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 12px;
+  text-align: center;
+  color: #333;
+}
+
+.depth-unit { color: #999; font-size: 11px; }
+
+.dual-slider-container {
+  position: relative;
+  height: 20px;
+}
+
+.slider-range {
+  position: absolute;
+  width: 100%;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  pointer-events: none;
+}
+
+.slider-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #7d6b5a;
+  cursor: pointer;
+  pointer-events: all;
+  border: 2px solid white;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
+/* ====== MACROCATEGORIE LITOLOGICHE ====== */
+.macro-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #888;
+  margin-bottom: 8px;
+}
+
+.macro-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.macro-card {
+  border: 2px solid #e8dcc8;
+  border-radius: 8px;
+  padding: 10px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: #faf8f5;
+}
+
+.macro-card:hover {
+  border-color: #b8a791;
+  background: #f5f0e8;
+}
+
+.macro-card.selected {
+  border-color: #8d6748;
+  background: #f5ede0;
+}
+
+.macro-icon {
+  font-size: 18px;
+  display: block;
+  margin-bottom: 4px;
+}
+
+.macro-name {
+  font-size: 12px;
+  font-weight: 700;
+  color: #3d3020;
+  margin-bottom: 2px;
+}
+
+.macro-examples {
+  font-size: 10px;
+  color: #888;
+  line-height: 1.3;
+  margin-bottom: 6px;
+}
+
+.macro-count {
+  font-size: 11px;
+  color: #8d6748;
+  font-weight: 600;
+}
+
+.count-loading { color: #ccc; }
+
+.lito-note {
+  font-size: 10px;
+  color: #aaa;
+  line-height: 1.4;
+  margin: 0;
+  font-style: italic;
+}
+
+/* ====== FLUIDI ====== */
+.fluido-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fluido-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1.5px solid #eee;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: #fafafa;
+}
+
+.fluido-chip:hover {
+  border-color: #ccc;
+  background: #f5f5f5;
+}
+
+.fluido-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.fluido-nome {
+  flex: 1;
+  font-size: 12px;
+  color: #333;
+  font-weight: 500;
+}
+
+.fluido-meta {
+  font-size: 10px;
+  color: black;
+}
+
+.fluido-eventi {
+  font-size: 11px;
+  color: black;
+  font-weight: 600;
+  min-width: 45px;
+  text-align: right;
+}
+
+/* ====== ISTOGRAMMA ====== */
+.histogram-wrapper {
+  width: 100%;
+  margin-bottom: 4px;
+}
+
+.histogram-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 9px;
+  color: #aaa;
+  margin-top: 2px;
+}
+
+/* ====== MATRICE ====== */
+.matrix-desc {
+  font-size: 11px;
+  color: #666;
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+
+.matrix-desc em { color: #8d6748; }
+
+.matrix-scroll {
+  overflow-x: auto;
+  margin-bottom: 12px;
+}
+
+.matrix-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.matrix-table th {
+  padding: 6px 8px;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 700;
+  color: #888;
+  text-transform: uppercase;
+  border-bottom: 1px solid #eee;
+}
+
+.lito-col { text-align: left !important; min-width: 90px; }
+
+.fluido-col { min-width: 50px; }
+
+.fluido-dot-small {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-right: 3px;
+  vertical-align: middle;
+}
+
+.matrix-table td {
+  padding: 6px 8px;
+  text-align: center;
+  border-bottom: 1px solid #f5f5f5;
+}
+
+.lito-name {
+  text-align: left !important;
+  font-weight: 600;
+  color: #444;
+  font-size: 11px;
+}
+
+.macro-dot { margin-right: 4px; }
+
+/* Celle colorate per intensità */
+.matrix-cell {
+  font-weight: 600;
+  border-radius: 4px;
+}
+
+.cell-zero { color: #ddd; }
+.cell-low  { background: #e8f5e9; color: #2e7d32; }
+.cell-mid  { background: #fff3e0; color: #e65100; }
+.cell-high { background: #ef5350; color: white; }
+.cell-empty { color: #ddd; font-weight: 400; }
+
+/* ====== LEGENDA INTENSITÀ ====== */
+.intensity-legend {
+  margin-bottom: 12px;
+}
+
+.legend-title {
+  display: block;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #aaa;
+  margin-bottom: 6px;
+}
+
+.legend-chips {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.intensity-chip {
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.i1  { background: #e8f5e9; color: #2e7d32; }
+.i5  { background: #c8e6c9; color: #1b5e20; }
+.i25 { background: #fff3e0; color: #e65100; }
+.i48 { background: #ef5350; color: white; }
+
+.legend-note {
+  font-size: 9px;
+  color: #aaa;
+  margin-left: 4px;
+}
+
+/* ====== TESI BOX ====== */
+.tesi-box {
+  background: #fffde7;
+  border: 1px solid #f9a825;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.tesi-icon {
+  font-size: 11px;
+  font-weight: 700;
+  color: #f57f17;
+  margin-bottom: 6px;
+}
+
+.tesi-text {
+  font-size: 11px;
+  color: #5d4037;
+  line-height: 1.5;
+  margin: 0;
+}
+
+/* ====== FOOTER ====== */
+.af-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  background: #e8dcc8;
+  border-top: 1px solid #c8b89a;
+  flex-shrink: 0;
+}
+
+.footer-left {
+  font-size: 13px;
+  color: #444;
+  white-space: nowrap;
+}
+
+.footer-left strong { color: #3d3020; }
+
+.footer-chips {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  flex-wrap: wrap;
+}
+
+.active-chip {
+  padding: 3px 10px;
+  border-radius: 20px;
+  border: 1.5px solid;
+  font-size: 11px;
+  font-weight: 600;
+  background: white;
+}
+
+.footer-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn-reset {
+  padding: 7px 18px;
+  border: 1.5px solid #aaa;
+  border-radius: 6px;
+  background: white;
+  color: #666;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-reset:hover { background: #f5f5f5; }
+
+.btn-apply {
+  padding: 7px 20px;
+  border: none;
+  border-radius: 6px;
+  background: #5d4e40;
+  color: white;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-apply:hover { background: #3d3020; }
+
+/* ====== SCROLLBAR ====== */
+.af-panel::-webkit-scrollbar { width: 4px; }
+.af-panel::-webkit-scrollbar-track { background: #f5f5f5; }
+.af-panel::-webkit-scrollbar-thumb { background: #d4c5b0; border-radius: 2px; }
+
+/* ====== MATRIX LOADING ====== */
+.matrix-loading {
+  text-align: center;
+  color: #bbb;
+  font-size: 12px;
+  padding: 20px;
+}
+
+.termini-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.termine-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border: 1.5px solid #e8dcc8;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: #faf8f5;
+}
+
+.termine-chip:hover { border-color: #b8a791; background: #f5f0e8; }
+.termine-chip.selected { border-color: #8d6748; background: #f5ede0; }
+.termine-nome { font-size: 12px; font-weight: 700; color: #3d3020; }
+.termine-stats { font-size: 10px; color: black; }
+.termine-chip.selected .termine-nome { color: #8d6748; }
+
+/* ====== DUAL SLIDER CHIARO ====== */
+.dual-slider-container {
+  position: relative;
+  height: 28px;
+  display: flex;
+  align-items: center;
+   /* Traccia disattivata/sfondo */
+  border-radius: 4px;
+  margin-top: 8px;
+  padding: 0 2px;
+}
+
+/* Traccia evidenziata tra min e max */
+.slider-track {
+  position: absolute;
+  height: 1px;
+   /* Colore dell'intervallo attivo */
+  border-radius: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+/* Input Range base */
+.slider-range {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  pointer-events: none; /* Permette il click passing */
+  margin: 0;
+}
+
+/* PALLINO (Thumb) - Webkit (Chrome, Safari, Edge) */
+.slider-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #5d4e40;
+  border: 2px solid #ffffff;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+  cursor: grab;
+  pointer-events: all; /* Riattiva le interazioni solo sui pallini */
+  transition: transform 0.15s ease, background-color 0.15s ease;
+}
+
+.slider-range::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+  background: #3d3020;
+}
+
+.slider-range::-webkit-slider-thumb:active {
+  cursor: grabbing;
+  transform: scale(1.1);
+  background: #2b2217;
+}
+
+/* PALLINO (Thumb) - Firefox */
+.slider-range::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #5d4e40;
+  border: 2px solid #ffffff;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+  cursor: grab;
+  pointer-events: all;
+  transition: transform 0.15s ease, background-color 0.15s ease;
+}
+
+.slider-range::-moz-range-thumb:hover {
+  transform: scale(1.2);
+  background: #3d3020;
+}
+
+/* Stile per gli input di testo della profondità */
+.depth-input {
+  width: 65px;
+  padding: 4px 6px;
+  border: 1.5px solid #d4c5b0;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  color: #3d3020;
+  background: #faf8f5;
+  transition: border-color 0.2s;
+}
+
+.depth-input:focus {
+  outline: none;
+  border-color: #7d6b5a;
+  background: #ffffff;
+}
+
+/* ====== BARRA PROFONDITÀ GLOBALE ====== */
+.global-depth-bar {
+  background: #ffffff;
+  margin: 12px 12px 0 12px;
+  padding: 12px 20px;
+  border-radius: 10px;
+  border: 1px solid #e0d8cc;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.depth-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.depth-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #5d4e40;
+  letter-spacing: 0.5px;
+}
+
+.depth-inputs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #666;
+}
+
+.depth-input {
+  width: 70px;
+  padding: 4px 6px;
+  border: 1.5px solid #d4c5b0;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+  color: #3d3020;
+  background: #faf8f5;
+}
+
+.depth-input:focus {
+  outline: none;
+  border-color: #7d6b5a;
+  background: #ffffff;
+}
+
+.depth-unit {
+  font-weight: 600;
+  color: #888;
+}
+
+/* ====== DUAL SLIDER STYLES ====== */
+.dual-slider-container {
+  position: relative;
+  height: 20px;
+  
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+}
+
+.slider-track {
+  position: absolute;
+  height: 3px;
+  background: #7d6b5a;
+  border-radius: 3px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.slider-range {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  pointer-events: none;
+  margin: 0;
+}
+
+.slider-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #5d4e40;
+  border: 2px solid #ffffff;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+  cursor: grab;
+  pointer-events: all;
+  transition: transform 0.15s ease;
+}
+
+.slider-range::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+  background: #3d3020;
+}
+
+.slider-range::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #5d4e40;
+  border: 2px solid #ffffff;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+  cursor: grab;
+  pointer-events: all;
+}
+</style>

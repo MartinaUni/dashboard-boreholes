@@ -119,7 +119,34 @@ def get_current_user(
         raise credentials_exception
     return utente
 
+from fastapi import Header
 
+# ==================================================
+# DEPENDENCY: utente corrente OPZIONALE
+# Non solleva errore se manca il token o è invalido:
+# restituisce None. Utile per endpoint che si comportano
+# diversamente per utenti loggati/non loggati, senza
+# bloccare l'accesso a chi non è autenticato.
+# ==================================================
+
+def get_current_user_optional(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db)
+) -> Optional[Utente]:
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+
+    token = authorization.removeprefix("Bearer ").strip()
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return None
+    except JWTError:
+        return None
+
+    return get_utente(db, username)
 # ==================================================
 # DEPENDENCY: solo utenti esperti
 # Aggiungere Depends(require_esperto) agli endpoint
@@ -198,17 +225,14 @@ def login(
 # Crea un nuovo utente base nel database.
 # Gli utenti esperti vanno creati manualmente su pgAdmin.
 # ==================================================
-
-@router.post("/registra", summary="Registrazione nuovo utente base")
+"""
+@router.post("/registra", summary="Registrazione nuovo utente esperto")
 def registra(
     username: str,
     password: str,
     db: Session = Depends(get_db)
 ):
-    """
-    Registra un nuovo utente con ruolo 'base'.
-    Per creare utenti esperti modificare direttamente il database.
-    """
+    
     if get_utente(db, username):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -218,12 +242,63 @@ def registra(
     nuovo_utente = Utente(
         username=username,
         password=hash_password(password),
-        ruolo="base"
+        ruolo="esperto"
     )
     db.add(nuovo_utente)
     db.commit()
 
-    return {"messaggio": f"Utente '{username}' creato con ruolo 'base'"}
+    return {"messaggio": f"Utente '{username}' creato con ruolo 'esperto'"}
+"""
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
+
+# Ruolo assegnato di default ai nuovi iscritti.
+# Il modello di accesso è binario (autenticato / non autenticato),
+# quindi ogni utente registrato è abilitato alle analisi avanzate.
+RUOLO_DEFAULT = "esperto"
+
+
+class RegistrazioneRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=72)  # 72 = limite di bcrypt
+
+
+@router.post(
+    "/registra",
+    status_code=status.HTTP_201_CREATED,
+    summary="Registrazione nuovo utente",
+)
+def registra(dati: RegistrazioneRequest, db: Session = Depends(get_db)):
+    """
+    Registra un nuovo utente. Non è prevista approvazione manuale:
+    l'utente può fare subito login e accedere agli endpoint protetti.
+    Restituisce 400 se lo username è già in uso.
+    """
+    if get_utente(db, dati.username):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username già esistente",
+        )
+
+    nuovo_utente = Utente(
+        username=dati.username,
+        password=hash_password(dati.password),
+        ruolo=RUOLO_DEFAULT,
+    )
+    db.add(nuovo_utente)
+
+    try:
+        db.commit()
+    except IntegrityError:
+        # due richieste simultanee con lo stesso username:
+        # il vincolo UNIQUE del DB fa da ultima difesa
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username già esistente",
+        )
+
+    return {"messaggio": f"Utente '{dati.username}' creato con ruolo '{RUOLO_DEFAULT}'"}
 
 
 # ==================================================

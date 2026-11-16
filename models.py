@@ -280,6 +280,40 @@ class Pozzo(Base):
     stato_rel = relationship("Stato")
     unita_rel = relationship("Unita")
 
+#NUOVA TABELLA PER MATRICE DI COOCCORRENZA
+# -*- coding: utf-8 -*-
+"""
+Da aggiungere a models.py, accanto alla definizione di Litologia.
+
+ATTENZIONE - verifica prima di usarlo:
+- Il tipo di colonna di `key` deve combaciare con Pozzo.key (qui presumo Integer,
+  come lascia intendere l'uso in filter(Mineralizzazioni.key.in_(db.query(Pozzo.key)))).
+- Il tipo di `daprof`/`aprof` deve combaciare con quello gia' usato in Litologia
+  (qui presumo Float; se nel tuo DB sono Numeric/Decimal, cambia di conseguenza).
+- Lo schema (`info_pozzi`, visto nella query "SELECT ... FROM info_pozzi.litologia")
+  va confermato: se il resto delle tabelle in models.py usa un __table_args__ con
+  schema esplicito, aggiungilo anche qui per coerenza.
+"""
+#from sqlalchemy import Column, Integer, Float, String
+#from database import Base  # stesso import base usato per gli altri modelli
+
+
+class LitologiaStandard(Base):
+    __tablename__ = "litologia_standard"
+    __table_args__ = {"schema": "info_pozzi"}
+
+    oid = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(Integer, ForeignKey("public.pozzi.key"), index=True)
+    #key = Column(Integer, ForeignKey("info_pozzi.well_coord.key"), index=True)
+
+    daprof = Column(Float)
+    aprof = Column(Float)
+
+    litologia_standard = Column(String(60))
+    ruolo = Column(String(15))
+    relazione = Column(String(30))
+    pozzo = relationship("Pozzo", backref="litologie_standard")
+    #pozzo = relationship("WellCoord", backref="litologie_standard")
 
 # DATI POZZO
 
@@ -529,52 +563,6 @@ class Rivest(Base):
     eni     = Column(Boolean)
 
     pozzo = relationship("Pozzo", backref="rivestimenti")
-
-"""
-class TempFin(Base):
-    __tablename__ = "temp_fin"
-    __table_args__ = {"schema": "info_pozzi"}
-
-    id_temp       = Column(Integer, primary_key=True)
-    key           = Column(Integer, ForeignKey("public.pozzi.key"))
-    data          = Column(String(10))
-    nr_misura     = Column(SmallInteger)
-    discesa       = Column(SmallInteger)
-    prof          = Column(Float)
-    temp          = Column(Float)
-    tcirc         = Column(Float)
-    metodo_misura = Column(SmallInteger, ForeignKey("info_cod.metodi.tipo_metodo"))
-
-    pozzo      = relationship("Pozzo",  backref="temperature_finali")
-    metodo_rel = relationship("Metodi")
-
-
-class TempRaw(Base):
-    __tablename__ = "temp_raw"
-    __table_args__ = {"schema": "info_pozzi"}
-
-    id_bht    = Column(Integer, primary_key=True)
-    data      = Column(String(10))
-    nr_misura = Column(SmallInteger)
-    discesa   = Column(SmallInteger)
-    prof      = Column(Float)
-    temp      = Column(Float)
-    tcirc     = Column(Float)
-    tstop     = Column(Float)
-
-
-class TempConnex(Base):
-    
-    __tablename__ = "temp_connex"
-    __table_args__ = {"schema": "info_pozzi"}
-
-    oid    = Column(Integer, primary_key=True)
-    id_bht = Column(Integer, ForeignKey("info_pozzi.temp_raw.id_bht"))
-    id_temp = Column(Integer, ForeignKey("info_pozzi.temp_fin.id_temp"))
-
-    temp_raw_rel = relationship("TempRaw")
-    temp_fin_rel = relationship("TempFin")
-"""
 
 
 # NUOVO MODELLO TEMPERATURE CORRETTO
